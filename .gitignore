@@ -1,10 +1,16 @@
-# Python-generated files
+# Python & uv
+.venv/
 __pycache__/
-*.py[oc]
-build/
+*.pyc
+.pytest_cache/
 dist/
-wheels/
-*.egg-info
+*.egg-info/
 
-# Virtual environments
-.venv
+# Secrets & local config
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

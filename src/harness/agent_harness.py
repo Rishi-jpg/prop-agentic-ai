@@ -3,9 +3,11 @@ import time
 from enum import Enum
 from typing import Any, Optional
 from pydantic import BaseModel, Field
+
 from src.agents.supervisor import AgentRoute, SupervisorOrchestrator
 from src.harness.guardrails import check_input_guardrails, redact_output_pii
 from src.llm.base import Message
+from src.observability.tracer import AgentTracer
 
 
 class ExecutionStatus(str, Enum):
@@ -30,17 +32,40 @@ class HarnessResponse(BaseModel):
 
 class AgentHarness:
     """Deterministic production wrapper around the Multi-Agent Orchestrator."""
+
     def __init__(
         self,
         orchestrator: SupervisorOrchestrator,
         compliance_region: str = "IN",
         timeout_seconds: float = 20.0,
         max_token_budget: int = 8000,
+        tracer: Optional[AgentTracer] = None,
     ):
         self.orchestrator = orchestrator
         self.compliance_region = compliance_region
         self.timeout_seconds = timeout_seconds
         self.max_token_budget = max_token_budget
+        self.tracer = tracer
+
+    def _record_trace(self, user_input: str, result: HarnessResponse) -> HarnessResponse:
+        """Send execution metadata to Langfuse / local tracer if configured."""
+        if self.tracer:
+            self.tracer.log_execution(
+                name="property_agent_execution",
+                user_input=user_input,
+                response=result.response,
+                metadata={
+                    "status": result.status.value,
+                    "route": result.route.value if result.route else None,
+                    "agent_name": result.agent_name,
+                    "requires_human_approval": result.requires_human_approval,
+                    "tool_calls": [tc["tool"] for tc in result.tool_calls_made],
+                    "total_tokens": result.total_tokens,
+                    "latency_ms": result.latency_ms,
+                    "audit_events": result.audit_events,
+                },
+            )
+        return result
 
     async def execute(
         self, user_input: str, history: Optional[list[Message]] = None
@@ -52,11 +77,14 @@ class AgentHarness:
         guard = check_input_guardrails(user_input, compliance_region=self.compliance_region)
         if not guard.allowed:
             audit_events.append(f"INPUT_BLOCKED: {guard.reason}")
-            return HarnessResponse(
-                status=ExecutionStatus.BLOCKED,
-                response=f"I cannot process this request. ({guard.reason})",
-                latency_ms=round((time.perf_counter() - start) * 1000, 2),
-                audit_events=audit_events,
+            return self._record_trace(
+                user_input,
+                HarnessResponse(
+                    status=ExecutionStatus.BLOCKED,
+                    response=f"I cannot process this request. ({guard.reason})",
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                    audit_events=audit_events,
+                ),
             )
         audit_events.append("INPUT_GUARDRAIL_PASSED")
 
@@ -68,11 +96,14 @@ class AgentHarness:
             )
         except asyncio.TimeoutError:
             audit_events.append(f"CIRCUIT_BREAKER_TIMEOUT: >{self.timeout_seconds}s")
-            return HarnessResponse(
-                status=ExecutionStatus.TIMEOUT,
-                response="The request took too long to process. Please try again or contact support.",
-                latency_ms=round((time.perf_counter() - start) * 1000, 2),
-                audit_events=audit_events,
+            return self._record_trace(
+                user_input,
+                HarnessResponse(
+                    status=ExecutionStatus.TIMEOUT,
+                    response="The request took too long to process. Please try again or contact support.",
+                    latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                    audit_events=audit_events,
+                ),
             )
 
         audit_events.append(f"ROUTED_TO:{decision.route.value}")
@@ -108,15 +139,18 @@ class AgentHarness:
             else ExecutionStatus.COMPLETED
         )
 
-        return HarnessResponse(
-            status=status,
-            response=safe_response,
-            route=decision.route,
-            agent_name=result.agent_name,
-            requires_human_approval=approval_payload is not None,
-            approval_payload=approval_payload,
-            tool_calls_made=result.tool_calls_made,
-            total_tokens=result.total_tokens,
-            latency_ms=round((time.perf_counter() - start) * 1000, 2),
-            audit_events=audit_events,
+        return self._record_trace(
+            user_input,
+            HarnessResponse(
+                status=status,
+                response=safe_response,
+                route=decision.route,
+                agent_name=result.agent_name,
+                requires_human_approval=approval_payload is not None,
+                approval_payload=approval_payload,
+                tool_calls_made=result.tool_calls_made,
+                total_tokens=result.total_tokens,
+                latency_ms=round((time.perf_counter() - start) * 1000, 2),
+                audit_events=audit_events,
+            ),
         )
